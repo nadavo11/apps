@@ -43,6 +43,7 @@ TRAIN_SCRIPT = MODELS_DIR / "train_edge_head_e2e.py"
 EVAL_SCRIPT = MODELS_DIR / "eval_edge_head_e2e.py"
 # Conda environment for the edge detection training
 CONDA_ENV = MODELS_DIR / "conda_edgehead"
+CONDA_PYTHON = CONDA_ENV / "bin" / "python"  # Direct path to Python executable
 DATA_DIR = APP_DIR / "data"  # Local app data
 LOG_FILE = DATA_DIR / "latest_run.log"
 PID_FILE = DATA_DIR / ".running_pid"
@@ -355,8 +356,8 @@ def read_log_tail(n_lines: int = 50) -> str:
 # -----------------------------------------------------------------------------
 def build_train_command(config: Dict) -> List[str]:
     """Build the training command from config."""
-    # Use conda run to execute in the correct environment
-    cmd = ["conda", "run", "--prefix", str(CONDA_ENV), "--no-capture-output", "python", str(TRAIN_SCRIPT)]
+    # Use direct Python path from conda environment (conda run doesn't work well with subprocess detach)
+    cmd = [str(CONDA_PYTHON), str(TRAIN_SCRIPT)]
     
     # Required paths
     cmd.extend(["--seams_root", config["seams_root"]])
@@ -414,8 +415,8 @@ def build_train_command(config: Dict) -> List[str]:
 
 def build_eval_command(config: Dict) -> List[str]:
     """Build the evaluation command from config."""
-    # Use conda run to execute in the correct environment
-    cmd = ["conda", "run", "--prefix", str(CONDA_ENV), "--no-capture-output", "python", str(EVAL_SCRIPT)]
+    # Use direct Python path from conda environment (conda run doesn't work well with subprocess detach)
+    cmd = [str(CONDA_PYTHON), str(EVAL_SCRIPT)]
     
     # Required
     cmd.extend(["--data_root", config["data_root"]])
