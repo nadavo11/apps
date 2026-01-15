@@ -1,0 +1,4 @@
+# Vacation Runner - Streamlit dependencies
+streamlit>=1.28.0
+psutil>=5.9.0
+pyngrok>=7.0.0
