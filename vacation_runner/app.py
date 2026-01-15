@@ -248,22 +248,93 @@ def start_process(command: List[str], script_type: str) -> bool:
         return False
 
 
-def stop_process() -> bool:
-    """Stop the running process."""
+def stop_process(force: bool = False) -> bool:
+    """Stop the running process. Use force=True for SIGKILL instead of SIGINT."""
     proc_info = get_running_process()
     if not proc_info:
-        st.warning("No process is currently running.")
+        # Check if there's a stale PID file anyway
+        if PID_FILE.exists():
+            PID_FILE.unlink(missing_ok=True)
+            st.info("🧹 Cleaned up stale PID file")
+        else:
+            st.warning("No process is currently running.")
         return False
     
     try:
         pid = proc_info["pid"]
-        os.killpg(os.getpgid(pid), signal.SIGINT)  # Graceful shutdown
+        sig = signal.SIGKILL if force else signal.SIGINT
+        sig_name = "SIGKILL" if force else "SIGINT"
+        
+        try:
+            # Try to kill the process group first
+            os.killpg(os.getpgid(pid), sig)
+        except (ProcessLookupError, PermissionError):
+            # Fallback to killing just the process
+            os.kill(pid, sig)
+        
         PID_FILE.unlink(missing_ok=True)
-        st.success(f"✅ Sent SIGINT to process {pid}")
+        st.success(f"✅ Sent {sig_name} to process {pid}")
         return True
     except Exception as e:
         st.error(f"❌ Failed to stop process: {e}")
+        # Still try to clean up PID file
+        PID_FILE.unlink(missing_ok=True)
         return False
+
+
+def force_kill_by_pid(pid: int) -> bool:
+    """Force kill a process by PID - resilient kill for orphaned processes."""
+    try:
+        # First try to kill the process group
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            # Fallback to killing just the process
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        
+        # Clean up PID file if it matches
+        if PID_FILE.exists():
+            try:
+                stored_pid = int(PID_FILE.read_text().strip())
+                if stored_pid == pid:
+                    PID_FILE.unlink(missing_ok=True)
+            except (ValueError, IOError):
+                pass
+        
+        return True
+    except Exception:
+        return False
+
+
+def find_training_processes() -> List[Dict]:
+    """Find any running training/eval processes by command pattern."""
+    processes = []
+    if not PSUTIL_AVAILABLE:
+        return processes
+    
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                cmdline = proc.info.get('cmdline', [])
+                if cmdline:
+                    cmd_str = ' '.join(cmdline)
+                    # Look for our training/eval scripts
+                    if 'train_edge_head_e2e.py' in cmd_str or 'eval_edge_head_e2e.py' in cmd_str:
+                        processes.append({
+                            'pid': proc.info['pid'],
+                            'name': proc.info['name'],
+                            'cmdline': cmd_str[:100] + '...' if len(cmd_str) > 100 else cmd_str,
+                            'create_time': datetime.fromtimestamp(proc.info['create_time']).strftime("%H:%M:%S")
+                        })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    
+    return processes
 
 
 def read_log_tail(n_lines: int = 50) -> str:
@@ -433,11 +504,52 @@ def main():
         with st.expander("Process Details", expanded=False):
             for k, v in proc.items():
                 st.text(f"{k}: {v}")
-        if st.button("🛑 Stop Process", type="primary", use_container_width=True):
-            stop_process()
-            st.rerun()
+        col_stop, col_kill = st.columns(2)
+        with col_stop:
+            if st.button("🛑 Stop (SIGINT)", use_container_width=True):
+                stop_process(force=False)
+                st.rerun()
+        with col_kill:
+            if st.button("💀 Force Kill (SIGKILL)", type="primary", use_container_width=True):
+                stop_process(force=True)
+                st.rerun()
     else:
         st.info("⚪ No process running")
+    
+    # Resilient kill section - find orphaned processes
+    with st.expander("🔧 **Process Manager** (orphaned processes)", expanded=False):
+        st.caption("Find and kill training processes that may have been orphaned")
+        if st.button("🔍 Scan for Training Processes", use_container_width=True):
+            st.session_state["scan_processes"] = True
+        
+        if st.session_state.get("scan_processes"):
+            orphaned = find_training_processes()
+            if orphaned:
+                st.warning(f"Found {len(orphaned)} training process(es):")
+                for p in orphaned:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.text(f"PID {p['pid']} ({p['create_time']})")
+                        st.caption(p['cmdline'])
+                    with col2:
+                        if st.button(f"💀 Kill", key=f"kill_{p['pid']}", use_container_width=True):
+                            if force_kill_by_pid(p['pid']):
+                                st.success(f"Killed PID {p['pid']}")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to kill PID {p['pid']}")
+            else:
+                st.success("✅ No training processes found")
+        
+        # Manual PID kill
+        st.divider()
+        st.caption("Or enter a PID manually:")
+        manual_pid = st.number_input("PID to kill", min_value=1, value=1, step=1, key="manual_pid")
+        if st.button("💀 Force Kill PID", use_container_width=True):
+            if force_kill_by_pid(int(manual_pid)):
+                st.success(f"✅ Sent SIGKILL to PID {manual_pid}")
+            else:
+                st.error(f"❌ Failed to kill PID {manual_pid}")
     
     st.divider()
     
@@ -643,40 +755,60 @@ def main():
     # Evaluation Tab
     # -------------------------------------------------------------------------
     with tab_eval:
+        # Load preferences (reuse from training tab scope or reload)
+        eval_prefs = load_preferences()
         eval_config = {}
+        
+        # Save preferences button at the top
+        col_save_eval, col_reset_eval = st.columns(2)
+        with col_save_eval:
+            if st.button("💾 Save Eval Settings", use_container_width=True, key="save_eval_btn"):
+                st.session_state["save_eval_prefs"] = True
+        with col_reset_eval:
+            if st.button("🔄 Reset Eval Defaults", use_container_width=True, key="reset_eval_btn"):
+                # Only reset eval portion
+                new_prefs = load_preferences()
+                new_prefs["eval"] = DEFAULT_EVAL_CONFIG.copy()
+                save_preferences(new_prefs.get("train", DEFAULT_TRAIN_CONFIG), DEFAULT_EVAL_CONFIG)
+                st.success("Reset eval to defaults!")
+                st.rerun()
         
         # Required paths
         with st.expander("📁 **Paths** (required)", expanded=True):
             eval_config["data_root"] = st.text_input(
                 "Data Root",
-                value="/path/to/dataset",
+                value=get_pref(eval_prefs, "eval", "data_root", DEFAULT_EVAL_CONFIG["data_root"]),
                 key="eval_data_root"
             )
             eval_config["ckpt"] = st.text_input(
                 "Checkpoint Path",
-                value=str(MODELS_DIR / "runs" / "best.pt"),
+                value=get_pref(eval_prefs, "eval", "ckpt", DEFAULT_EVAL_CONFIG["ckpt"]),
                 help="Path to model checkpoint (.pt file)"
             )
             eval_config["out_dir"] = st.text_input(
                 "Output Directory",
-                value=str(MODELS_DIR / "runs" / "eval_output"),
+                value=get_pref(eval_prefs, "eval", "out_dir", DEFAULT_EVAL_CONFIG["out_dir"]),
                 key="eval_out_dir"
             )
         
         # Dataset config
+        dataset_options = ["seams", "rwtd"]
+        split_options = ["train", "val", "test"]
         with st.expander("📊 **Dataset Configuration**", expanded=True):
             col1, col2 = st.columns(2)
             with col1:
+                default_dataset = get_pref(eval_prefs, "eval", "dataset", DEFAULT_EVAL_CONFIG["dataset"])
                 eval_config["dataset"] = st.selectbox(
                     "Dataset Type",
-                    options=["seams", "rwtd"],
-                    index=0
+                    options=dataset_options,
+                    index=dataset_options.index(default_dataset) if default_dataset in dataset_options else 0
                 )
             with col2:
+                default_split = get_pref(eval_prefs, "eval", "split", DEFAULT_EVAL_CONFIG["split"])
                 eval_config["split"] = st.selectbox(
                     "Split",
-                    options=["train", "val", "test"],
-                    index=2
+                    options=split_options,
+                    index=split_options.index(default_split) if default_split in split_options else 2
                 )
         
         # Runtime
@@ -684,44 +816,75 @@ def main():
             col1, col2 = st.columns(2)
             with col1:
                 eval_config["batch_size"] = st.number_input(
-                    "Batch Size", min_value=1, max_value=32, value=4, key="eval_batch"
+                    "Batch Size", min_value=1, max_value=32,
+                    value=int(get_pref(eval_prefs, "eval", "batch_size", DEFAULT_EVAL_CONFIG["batch_size"])),
+                    key="eval_batch"
                 )
                 eval_config["workers"] = st.number_input(
-                    "Workers", min_value=0, max_value=16, value=4, key="eval_workers"
+                    "Workers", min_value=0, max_value=16,
+                    value=int(get_pref(eval_prefs, "eval", "workers", DEFAULT_EVAL_CONFIG["workers"])),
+                    key="eval_workers"
                 )
             with col2:
                 eval_config["image_size"] = st.number_input(
-                    "Image Size", min_value=256, max_value=2048, value=1008, key="eval_img_size"
+                    "Image Size", min_value=256, max_value=2048,
+                    value=int(get_pref(eval_prefs, "eval", "image_size", DEFAULT_EVAL_CONFIG["image_size"])),
+                    key="eval_img_size"
                 )
         
         # Eval settings
+        eval_mode_options_eval = ["edge", "binary"]
         with st.expander("📏 **Evaluation Metrics**"):
+            default_eval_mode_eval = get_pref(eval_prefs, "eval", "eval_mode", DEFAULT_EVAL_CONFIG["eval_mode"])
             eval_config["eval_mode"] = st.selectbox(
-                "Mode", options=["edge", "binary"], index=0, key="eval_mode_select"
+                "Mode", options=eval_mode_options_eval,
+                index=eval_mode_options_eval.index(default_eval_mode_eval) if default_eval_mode_eval in eval_mode_options_eval else 0,
+                key="eval_mode_select"
             )
             eval_config["thresholds"] = st.number_input(
-                "Thresholds", min_value=1, max_value=999, value=99
+                "Thresholds", min_value=1, max_value=999,
+                value=int(get_pref(eval_prefs, "eval", "thresholds", DEFAULT_EVAL_CONFIG["thresholds"]))
             )
             eval_config["nproc"] = st.number_input(
-                "Parallel Workers", min_value=1, max_value=16, value=4
+                "Parallel Workers", min_value=1, max_value=16,
+                value=int(get_pref(eval_prefs, "eval", "nproc", DEFAULT_EVAL_CONFIG["nproc"]))
             )
             col1, col2 = st.columns(2)
             with col1:
-                eval_config["apply_thinning"] = st.checkbox("Apply Thinning", value=False)
+                eval_config["apply_thinning"] = st.checkbox(
+                    "Apply Thinning",
+                    value=bool(get_pref(eval_prefs, "eval", "apply_thinning", DEFAULT_EVAL_CONFIG["apply_thinning"]))
+                )
             with col2:
-                eval_config["apply_nms"] = st.checkbox("Apply NMS", value=False)
+                eval_config["apply_nms"] = st.checkbox(
+                    "Apply NMS",
+                    value=bool(get_pref(eval_prefs, "eval", "apply_nms", DEFAULT_EVAL_CONFIG["apply_nms"]))
+                )
         
         # W&B
         with st.expander("📊 **Logging**"):
-            eval_config["wandb"] = st.checkbox("Enable W&B Logging", value=False, key="eval_wandb")
+            eval_config["wandb"] = st.checkbox(
+                "Enable W&B Logging",
+                value=bool(get_pref(eval_prefs, "eval", "wandb", DEFAULT_EVAL_CONFIG["wandb"])),
+                key="eval_wandb"
+            )
         
         # Custom flags
         with st.expander("🎛️ **Custom Flags**"):
             eval_config["custom_flags"] = st.text_input(
                 "Additional Arguments",
+                value=get_pref(eval_prefs, "eval", "custom_flags", DEFAULT_EVAL_CONFIG["custom_flags"]),
                 placeholder="--preview_limit 32",
                 key="eval_custom"
             )
+        
+        # Handle save preferences
+        if st.session_state.get("save_eval_prefs"):
+            if save_preferences(eval_prefs.get("train", DEFAULT_TRAIN_CONFIG), eval_config):
+                st.success("✅ Eval preferences saved!")
+            else:
+                st.error("❌ Failed to save eval preferences")
+            st.session_state["save_eval_prefs"] = False
         
         # Command preview
         st.subheader("📋 Command Preview")
