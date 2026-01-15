@@ -10,9 +10,10 @@ Usage:
 import os
 import subprocess
 import signal
+import json
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import streamlit as st
 
@@ -46,9 +47,89 @@ DATA_DIR = APP_DIR / "data"  # Local app data
 LOG_FILE = DATA_DIR / "latest_run.log"
 PID_FILE = DATA_DIR / ".running_pid"
 NGROK_URL_FILE = DATA_DIR / ".ngrok_url"
+CONFIG_FILE = DATA_DIR / "user_preferences.json"
 
 # Ensure app data directory exists
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------------------------------------------------------
+# Default Training Configuration (user's preferred defaults)
+# -----------------------------------------------------------------------------
+DEFAULT_TRAIN_CONFIG = {
+    "seams_root": str(PROJECT_ROOT / "data_generators" / "inpainted" / "seams2"),
+    "out_dir": str(MODELS_DIR / "attn_head"),
+    "lr": 3e-4,
+    "epochs": 100,
+    "batch_size": 8,
+    "weight_decay": 5e-4,
+    "model": "attn_lite",
+    "sam_variant": "sam3_base",
+    "lateral_dim": 32,
+    "dropout": 0.3,
+    "val_split": "test",
+    "image_size": 1008,
+    "workers": 2,
+    "use_loc_loss": True,
+    "loc_loss_weight": 1.0,
+    "use_dice_loss": True,
+    "dice_weight": 0.1,
+    "eval_every": 5,
+    "eval_mode": "edge",
+    "amp": True,
+    "compile": False,
+    "resume": False,
+    "wandb": True,
+    "wandb_project": "sam3-edge",
+    "custom_flags": "--label_smoothing_sigma 1.5",
+}
+
+DEFAULT_EVAL_CONFIG = {
+    "data_root": "/path/to/dataset",
+    "ckpt": str(MODELS_DIR / "runs" / "best.pt"),
+    "out_dir": str(MODELS_DIR / "runs" / "eval_output"),
+    "dataset": "seams",
+    "split": "test",
+    "batch_size": 4,
+    "workers": 4,
+    "image_size": 1008,
+    "eval_mode": "edge",
+    "thresholds": 99,
+    "nproc": 4,
+    "apply_thinning": False,
+    "apply_nms": False,
+    "wandb": False,
+    "custom_flags": "",
+}
+
+
+# -----------------------------------------------------------------------------
+# Preferences Management
+# -----------------------------------------------------------------------------
+def load_preferences() -> Dict[str, Any]:
+    """Load user preferences from JSON file."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"train": DEFAULT_TRAIN_CONFIG.copy(), "eval": DEFAULT_EVAL_CONFIG.copy()}
+
+
+def save_preferences(train_config: Dict, eval_config: Dict) -> bool:
+    """Save user preferences to JSON file."""
+    try:
+        prefs = {"train": train_config, "eval": eval_config}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(prefs, f, indent=2)
+        return True
+    except IOError:
+        return False
+
+
+def get_pref(prefs: Dict, section: str, key: str, default: Any) -> Any:
+    """Get a preference value with fallback to default."""
+    return prefs.get(section, {}).get(key, default)
 
 # -----------------------------------------------------------------------------
 # Ngrok Management
@@ -367,18 +448,33 @@ def main():
     # Training Tab
     # -------------------------------------------------------------------------
     with tab_train:
+        # Load preferences
+        prefs = load_preferences()
         train_config = {}
+        
+        # Save preferences button at the top
+        col_save, col_reset = st.columns(2)
+        with col_save:
+            if st.button("💾 Save Current Settings", use_container_width=True):
+                # We'll collect the config at the end and save
+                st.session_state["save_train_prefs"] = True
+        with col_reset:
+            if st.button("🔄 Reset to Defaults", use_container_width=True):
+                if CONFIG_FILE.exists():
+                    CONFIG_FILE.unlink()
+                st.success("Reset to defaults!")
+                st.rerun()
         
         # Required paths
         with st.expander("📁 **Data Paths** (required)", expanded=True):
             train_config["seams_root"] = st.text_input(
                 "Seams Root",
-                value="/path/to/seams_dataset",
+                value=get_pref(prefs, "train", "seams_root", DEFAULT_TRAIN_CONFIG["seams_root"]),
                 help="Root directory containing train/val/test folders"
             )
             train_config["out_dir"] = st.text_input(
                 "Output Directory",
-                value=str(MODELS_DIR / "runs" / "new_run"),
+                value=get_pref(prefs, "train", "out_dir", DEFAULT_TRAIN_CONFIG["out_dir"]),
                 help="Where to save checkpoints and logs"
             )
         
@@ -389,98 +485,148 @@ def main():
                 train_config["lr"] = st.number_input(
                     "Learning Rate",
                     min_value=1e-6, max_value=1e-1,
-                    value=3e-4, format="%.1e", step=1e-5
+                    value=float(get_pref(prefs, "train", "lr", DEFAULT_TRAIN_CONFIG["lr"])),
+                    format="%.1e", step=1e-5
                 )
                 train_config["epochs"] = st.number_input(
-                    "Epochs", min_value=1, max_value=1000, value=100
+                    "Epochs", min_value=1, max_value=1000,
+                    value=int(get_pref(prefs, "train", "epochs", DEFAULT_TRAIN_CONFIG["epochs"]))
                 )
             with col2:
                 train_config["batch_size"] = st.number_input(
-                    "Batch Size", min_value=1, max_value=32, value=4
+                    "Batch Size", min_value=1, max_value=32,
+                    value=int(get_pref(prefs, "train", "batch_size", DEFAULT_TRAIN_CONFIG["batch_size"]))
                 )
                 train_config["weight_decay"] = st.number_input(
                     "Weight Decay", min_value=0.0, max_value=0.1,
-                    value=5e-4, format="%.1e", step=1e-5
+                    value=float(get_pref(prefs, "train", "weight_decay", DEFAULT_TRAIN_CONFIG["weight_decay"])),
+                    format="%.1e", step=1e-5
                 )
         
         # Model config
+        model_options = ["ced", "linear_probe", "attn_lite"]
+        sam_options = ["sam3_tiny", "sam3_small", "sam3_base", "sam3_large"]
         with st.expander("🧠 **Model Configuration**"):
+            default_model = get_pref(prefs, "train", "model", DEFAULT_TRAIN_CONFIG["model"])
             train_config["model"] = st.selectbox(
                 "Model Architecture",
-                options=["ced", "linear_probe", "attn_lite"],
-                index=0
+                options=model_options,
+                index=model_options.index(default_model) if default_model in model_options else 2
             )
+            default_sam = get_pref(prefs, "train", "sam_variant", DEFAULT_TRAIN_CONFIG["sam_variant"])
             train_config["sam_variant"] = st.selectbox(
                 "SAM Variant",
-                options=["sam3_tiny", "sam3_small", "sam3_base", "sam3_large"],
-                index=2
+                options=sam_options,
+                index=sam_options.index(default_sam) if default_sam in sam_options else 2
             )
             col1, col2 = st.columns(2)
             with col1:
                 train_config["lateral_dim"] = st.number_input(
-                    "Lateral Dim", min_value=16, max_value=256, value=64
+                    "Lateral Dim", min_value=16, max_value=256,
+                    value=int(get_pref(prefs, "train", "lateral_dim", DEFAULT_TRAIN_CONFIG["lateral_dim"]))
                 )
             with col2:
                 train_config["dropout"] = st.number_input(
-                    "Dropout", min_value=0.0, max_value=0.9, value=0.3, step=0.1
+                    "Dropout", min_value=0.0, max_value=0.9,
+                    value=float(get_pref(prefs, "train", "dropout", DEFAULT_TRAIN_CONFIG["dropout"])),
+                    step=0.1
                 )
         
         # Data config
+        val_options = ["val", "test"]
         with st.expander("📊 **Data Configuration**"):
+            default_val = get_pref(prefs, "train", "val_split", DEFAULT_TRAIN_CONFIG["val_split"])
             train_config["val_split"] = st.selectbox(
-                "Validation Split", options=["val", "test"], index=1
+                "Validation Split", options=val_options,
+                index=val_options.index(default_val) if default_val in val_options else 1
             )
             train_config["image_size"] = st.number_input(
-                "Image Size", min_value=256, max_value=2048, value=1008
+                "Image Size", min_value=256, max_value=2048,
+                value=int(get_pref(prefs, "train", "image_size", DEFAULT_TRAIN_CONFIG["image_size"]))
             )
             train_config["workers"] = st.number_input(
-                "DataLoader Workers", min_value=0, max_value=16, value=2
+                "DataLoader Workers", min_value=0, max_value=16,
+                value=int(get_pref(prefs, "train", "workers", DEFAULT_TRAIN_CONFIG["workers"]))
             )
         
         # Loss settings
         with st.expander("📉 **Loss Settings**"):
             col1, col2 = st.columns(2)
             with col1:
-                train_config["use_loc_loss"] = st.checkbox("Use Loc Loss", value=True)
+                train_config["use_loc_loss"] = st.checkbox(
+                    "Use Loc Loss",
+                    value=bool(get_pref(prefs, "train", "use_loc_loss", DEFAULT_TRAIN_CONFIG["use_loc_loss"]))
+                )
                 train_config["loc_loss_weight"] = st.number_input(
-                    "Loc Weight", min_value=0.0, max_value=10.0, value=1.0
+                    "Loc Weight", min_value=0.0, max_value=10.0,
+                    value=float(get_pref(prefs, "train", "loc_loss_weight", DEFAULT_TRAIN_CONFIG["loc_loss_weight"]))
                 )
             with col2:
-                train_config["use_dice_loss"] = st.checkbox("Use Dice Loss", value=True)
+                train_config["use_dice_loss"] = st.checkbox(
+                    "Use Dice Loss",
+                    value=bool(get_pref(prefs, "train", "use_dice_loss", DEFAULT_TRAIN_CONFIG["use_dice_loss"]))
+                )
                 train_config["dice_weight"] = st.number_input(
-                    "Dice Weight", min_value=0.0, max_value=10.0, value=0.1
+                    "Dice Weight", min_value=0.0, max_value=10.0,
+                    value=float(get_pref(prefs, "train", "dice_weight", DEFAULT_TRAIN_CONFIG["dice_weight"]))
                 )
         
         # Eval settings
+        eval_mode_options = ["edge", "binary"]
         with st.expander("📏 **Evaluation Settings**"):
             train_config["eval_every"] = st.number_input(
-                "Eval Every N Epochs", min_value=1, max_value=50, value=5
+                "Eval Every N Epochs", min_value=1, max_value=50,
+                value=int(get_pref(prefs, "train", "eval_every", DEFAULT_TRAIN_CONFIG["eval_every"]))
             )
+            default_eval_mode = get_pref(prefs, "train", "eval_mode", DEFAULT_TRAIN_CONFIG["eval_mode"])
             train_config["eval_mode"] = st.selectbox(
-                "Eval Mode", options=["edge", "binary"], index=0
+                "Eval Mode", options=eval_mode_options,
+                index=eval_mode_options.index(default_eval_mode) if default_eval_mode in eval_mode_options else 0
             )
         
         # Advanced
         with st.expander("🔧 **Advanced Options**"):
             col1, col2 = st.columns(2)
             with col1:
-                train_config["amp"] = st.checkbox("Use AMP (Mixed Precision)", value=False)
-                train_config["compile"] = st.checkbox("Use torch.compile", value=False)
+                train_config["amp"] = st.checkbox(
+                    "Use AMP (Mixed Precision)",
+                    value=bool(get_pref(prefs, "train", "amp", DEFAULT_TRAIN_CONFIG["amp"]))
+                )
+                train_config["compile"] = st.checkbox(
+                    "Use torch.compile",
+                    value=bool(get_pref(prefs, "train", "compile", DEFAULT_TRAIN_CONFIG["compile"]))
+                )
             with col2:
-                train_config["resume"] = st.checkbox("Resume from Checkpoint", value=False)
-                train_config["wandb"] = st.checkbox("Enable W&B Logging", value=False)
+                train_config["resume"] = st.checkbox(
+                    "Resume from Checkpoint",
+                    value=bool(get_pref(prefs, "train", "resume", DEFAULT_TRAIN_CONFIG["resume"]))
+                )
+                train_config["wandb"] = st.checkbox(
+                    "Enable W&B Logging",
+                    value=bool(get_pref(prefs, "train", "wandb", DEFAULT_TRAIN_CONFIG["wandb"]))
+                )
             if train_config["wandb"]:
                 train_config["wandb_project"] = st.text_input(
-                    "W&B Project", value="sam3-edge-e2e"
+                    "W&B Project",
+                    value=get_pref(prefs, "train", "wandb_project", DEFAULT_TRAIN_CONFIG["wandb_project"])
                 )
         
         # Custom flags
         with st.expander("🎛️ **Custom Flags**"):
             train_config["custom_flags"] = st.text_input(
                 "Additional Arguments",
+                value=get_pref(prefs, "train", "custom_flags", DEFAULT_TRAIN_CONFIG["custom_flags"]),
                 placeholder="--seed 42 --augment",
                 help="Space-separated extra flags to append to the command"
             )
+        
+        # Handle save preferences
+        if st.session_state.get("save_train_prefs"):
+            if save_preferences(train_config, prefs.get("eval", DEFAULT_EVAL_CONFIG)):
+                st.success("✅ Preferences saved!")
+            else:
+                st.error("❌ Failed to save preferences")
+            st.session_state["save_train_prefs"] = False
         
         # Command preview
         st.subheader("📋 Command Preview")
